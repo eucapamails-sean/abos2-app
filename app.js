@@ -13,6 +13,8 @@ let isTyping = false;
 let currentStreamReader = null; // For cancelling active streams
 let artifactsPanelOpen = false;
 let artifactsActiveTab = 'all'; // 'all' | 'uploaded' | 'generated'
+let previewPanelOpen = false;
+let previewCurrentFile = null; // { name, content } of file being previewed
 let pendingFiles = [];
 let fileCache = {}; // agentId -> [file objects]
 
@@ -27,7 +29,10 @@ const aiConfig = {
   defaultModel: 'claude-3.5-sonnet',
   temperature: 0.7,
   maxTokens: 4096,
-  perAgentModels: {}
+  perAgentModels: {},
+  opencodeUrl: '',
+  opencodeUsername: '',
+  opencodePassword: '',
 };
 
 // Initialize
@@ -50,6 +55,23 @@ document.addEventListener('DOMContentLoaded', () => {
   
   // Keyboard shortcuts
   document.addEventListener('keydown', handleKeyboard);
+  
+  // Listen for preview iframe navigation requests (inter-page links)
+  window.addEventListener('message', function(e) {
+    if (e.data && e.data.type === 'preview-navigate' && e.data.file) {
+      // Resolve the file path (strip leading ./ or /)
+      let targetFile = e.data.file.replace(/^\.?\//, '');
+      // Strip query strings and hash
+      targetFile = targetFile.split('?')[0].split('#')[0];
+      if (targetFile && currentAgentId) {
+        previewFile(currentAgentId, targetFile);
+        // Update tab highlighting
+        document.querySelectorAll('.preview-file-tab').forEach(t => {
+          t.classList.toggle('active', t.textContent === targetFile);
+        });
+      }
+    }
+  });
   
   // Now load from backend in background (non-blocking)
   MemoryStore._loadFromBackend().then(() => {
@@ -78,6 +100,10 @@ function applyLoadedSettings(settings) {
       aiConfig.perAgentModels = typeof settings.perAgentModels === 'string' ? JSON.parse(settings.perAgentModels) : settings.perAgentModels;
     } catch(e) { aiConfig.perAgentModels = {}; }
   }
+  if (settings.opencodeUrl) aiConfig.opencodeUrl = settings.opencodeUrl;
+  if (settings.opencodeUsername) aiConfig.opencodeUsername = settings.opencodeUsername;
+  if (settings.opencodePassword) aiConfig.opencodePassword = settings.opencodePassword;
+  // OpenCode credentials are used server-side via CGI proxy — no browser-side configure needed
   if (settings.theme) {
     currentTheme = settings.theme;
     document.documentElement.setAttribute('data-theme', currentTheme);
@@ -506,9 +532,26 @@ function renderAgentChat(container) {
       .artifacts-actions .btn { width:100%; }
       @media (max-width: 768px) {
         .artifacts-panel { position:absolute; right:0; top:0; bottom:0; z-index:50; width:280px; box-shadow:-4px 0 20px rgba(0,0,0,0.3); }
+        .preview-panel { position:absolute; right:0; top:0; bottom:0; z-index:50; box-shadow:-4px 0 20px rgba(0,0,0,0.3); }
       }
+      /* Preview Panel */
+      .preview-panel { flex:1; min-width:320px; max-width:60%; border-left:1px solid var(--color-border-subtle); display:flex; flex-direction:column; background:var(--color-surface-1,var(--color-bg)); overflow:hidden; }
+      .preview-panel-header { display:flex; align-items:center; justify-content:space-between; padding:10px 16px; border-bottom:1px solid var(--color-border-subtle); gap:8px; }
+      .preview-panel-title { font-size:13px; font-weight:700; color:var(--color-text); white-space:nowrap; }
+      .preview-file-tabs { display:flex; gap:2px; flex:1; overflow-x:auto; padding:0 4px; }
+      .preview-file-tab { background:none; border:1px solid transparent; padding:4px 10px; font-size:11px; font-weight:600; color:var(--color-text-faint); cursor:pointer; border-radius:6px; transition:all 0.15s; font-family:inherit; white-space:nowrap; }
+      .preview-file-tab:hover { color:var(--color-text-muted); background:var(--color-surface-2); }
+      .preview-file-tab.active { color:var(--color-primary); background:rgba(0,212,170,0.1); border-color:rgba(0,212,170,0.2); }
+      .preview-iframe-wrap { flex:1; position:relative; background:#fff; }
+      .preview-iframe-wrap iframe { width:100%; height:100%; border:none; }
+      .preview-loading { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:var(--color-surface-1); color:var(--color-text-muted); font-size:13px; }
+      .preview-empty { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; color:var(--color-text-faint); gap:12px; padding:40px; text-align:center; }
+      .preview-empty-icon { font-size:36px; }
+      .preview-empty-text { font-size:13px; line-height:1.6; }
+      .preview-toolbar { display:flex; align-items:center; gap:6px; padding:8px 12px; border-top:1px solid var(--color-border-subtle); background:var(--color-surface-2); }
+      .preview-toolbar .btn { font-size:11px; padding:4px 10px; }
     </style>
-    <div class="chat-layout ${memoryPanelOpen ? 'memory-open' : ''} ${artifactsPanelOpen ? 'artifacts-open' : ''}" id="chat-layout">
+    <div class="chat-layout ${memoryPanelOpen ? 'memory-open' : ''} ${artifactsPanelOpen ? 'artifacts-open' : ''} ${previewPanelOpen ? 'preview-open' : ''}" id="chat-layout">
       <div class="chat-container">
         <!-- Chat Header -->
         <div class="chat-header">
@@ -526,6 +569,11 @@ function renderAgentChat(container) {
             <button class="header-btn" onclick="startNewSession('${agent.id}')" title="New Session">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
             </button>
+            ${agent.backend === 'opencode' ? `
+            <button class="header-btn ${previewPanelOpen ? 'text-primary' : ''}" onclick="togglePreviewPanel('${agent.id}')" title="Toggle Preview">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+            </button>
+            ` : ''}
             <button class="header-btn ${artifactsPanelOpen ? 'text-primary' : ''}" onclick="toggleArtifactsPanel()" title="Toggle Artifacts">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
             </button>
@@ -623,6 +671,32 @@ function renderAgentChat(container) {
         </div>
       </div>
       ` : ''}
+      
+      <!-- Preview Panel (OpenCode agents only) -->
+      ${previewPanelOpen && agent.backend === 'opencode' ? `
+      <div class="preview-panel" id="preview-panel">
+        <div class="preview-panel-header">
+          <span class="preview-panel-title">Preview</span>
+          <div class="preview-file-tabs" id="preview-file-tabs"></div>
+          <button class="header-btn" onclick="togglePreviewPanel('${agent.id}')" style="width:24px;height:24px;flex-shrink:0;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <div class="preview-iframe-wrap" id="preview-iframe-wrap">
+          <div class="preview-empty" id="preview-empty">
+            <div class="preview-empty-icon">🖥️</div>
+            <div class="preview-empty-text">Loading workspace files...</div>
+          </div>
+        </div>
+        <div class="preview-toolbar">
+          <button class="btn btn-sm btn-ghost" onclick="refreshPreview('${agent.id}')" title="Refresh files">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+            Refresh
+          </button>
+          <span style="font-size:10px;color:var(--color-text-faint);margin-left:auto;" id="preview-status">Ready</span>
+        </div>
+      </div>
+      ` : ''}
     </div>
   `;
   
@@ -634,6 +708,9 @@ function renderAgentChat(container) {
     renderPendingFiles();
     if (artifactsPanelOpen) {
       renderArtifactsList(agent.id);
+    }
+    if (previewPanelOpen && agent.backend === 'opencode') {
+      loadPreviewFiles(agent.id);
     }
   });
 }
@@ -738,9 +815,13 @@ async function sendMessage(agentId) {
   
   isTyping = true;
   
+  const isOpenCodeAgent = agent?.backend === 'opencode';
+  const hasOpenCode = OpenCodeAPI.isConfigured();
   const hasApiKey = !!aiConfig.openrouterKey;
   
-  if (hasApiKey) {
+  if (isOpenCodeAgent && hasOpenCode) {
+    await sendOpenCodeMessage(agentId, agent, messagesEl, messages, aiContent);
+  } else if (hasApiKey) {
     // ---- REAL AI MODE ----
     await sendRealAIMessage(agentId, agent, messagesEl, messages, aiContent, imageDataUrls);
   } else {
@@ -882,6 +963,194 @@ async function sendRealAIMessage(agentId, agent, messagesEl, messages, aiContent
     currentStreamReader = null;
   }
 }
+
+// ─── OpenCode Message Handler ────────────────────────────────────────────────
+
+async function sendOpenCodeMessage(agentId, agent, messagesEl, messages, prompt) {
+  // Per-agent OpenCode session map
+  if (!window._opencodeSessions) window._opencodeSessions = {};
+
+  // Create the streaming bubble
+  const streamBubbleId = 'oc-bubble-' + Date.now();
+  const streamMsgDiv = document.createElement('div');
+  streamMsgDiv.className = 'message assistant';
+  streamMsgDiv.innerHTML = `
+    <div class="message-avatar">${agent.icon}</div>
+    <div style="flex:1;min-width:0;">
+      <div class="message-bubble" id="${streamBubbleId}">
+        <span style="color:var(--color-text-muted);font-size:12px;">⚡ OpenCode working...</span>
+        <span class="streaming-cursor"></span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:4px;">
+        <div class="message-time" id="${streamBubbleId}-time">Connecting to OpenCode...</div>
+        <button class="btn btn-sm btn-ghost" id="${streamBubbleId}-abort"
+          onclick="opencodeAbortSession('${agentId}')"
+          style="font-size:10px;padding:2px 8px;color:var(--color-error);">Abort</button>
+      </div>
+    </div>
+  `;
+  messagesEl.appendChild(streamMsgDiv);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+
+  const getBubble  = () => document.getElementById(streamBubbleId);
+  const getTimeEl  = () => document.getElementById(`${streamBubbleId}-time`);
+  const getAbortBtn = () => document.getElementById(`${streamBubbleId}-abort`);
+
+  const setStatus = (msg) => {
+    const t = getTimeEl();
+    if (t) t.textContent = msg;
+  };
+
+  const setError = (msg) => {
+    const b = getBubble();
+    if (b) b.innerHTML = `<span style="color:var(--color-error);">${escapeHtml(msg)}</span>`;
+    setStatus('Failed');
+    const ab = getAbortBtn();
+    if (ab) ab.remove();
+    isTyping = false;
+  };
+
+  try {
+    // Get or create a session for this agent
+    let sessionId = window._opencodeSessions[agentId];
+    if (!sessionId) {
+      setStatus('Creating OpenCode session...');
+      const session = await OpenCodeAPI.createSession(`ABOS — ${agent.name}`);
+      sessionId = session.id || session.ID || session.sessionId;
+      if (!sessionId) throw new Error('Failed to create OpenCode session — no ID returned');
+      window._opencodeSessions[agentId] = sessionId;
+    }
+
+    setStatus('Sending prompt to OpenCode...');
+
+    // Determine model from config
+    const modelOverride = aiConfig.perAgentModels[agentId];
+    let providerID, modelID;
+    if (modelOverride) {
+      const modelMap = {
+        'claude-3.5-sonnet': { providerID: 'anthropic', modelID: 'claude-3-5-sonnet-20241022' },
+        'claude-4-opus':     { providerID: 'anthropic', modelID: 'claude-opus-4-5' },
+        'gpt-4o':            { providerID: 'openai',    modelID: 'gpt-4o' },
+        'gpt-5':             { providerID: 'openai',    modelID: 'gpt-4o' },
+        'gemini-2.0-flash':  { providerID: 'google',    modelID: 'gemini-2.0-flash' },
+        'deepseek-v3':       { providerID: 'deepseek',  modelID: 'deepseek-chat' },
+      };
+      const mapped = modelMap[modelOverride];
+      if (mapped) { providerID = mapped.providerID; modelID = mapped.modelID; }
+    }
+
+    // Send the prompt and await full response
+    const result = await OpenCodeAPI.sendPrompt(sessionId, prompt, providerID, modelID);
+
+    // result should be { info: Message, parts: Part[] }
+    const parts = (result && result.parts) ? result.parts : [];
+    const textParts = [];
+    const toolParts = [];
+
+    for (const part of parts) {
+      const ptype = part.type || '';
+      if (ptype === 'text') {
+        textParts.push(part.text || '');
+      } else if (
+        ptype === 'tool-invocation' || ptype === 'tool_use' ||
+        ptype === 'tool-use' || ptype === 'tool_result'
+      ) {
+        toolParts.push(part);
+      } else if (part.text) {
+        textParts.push(part.text);
+      }
+    }
+
+    // Fallback if result came back as a plain string
+    if (textParts.length === 0 && result && typeof result === 'string') {
+      textParts.push(result);
+    }
+
+    const responseText = textParts.join('\n\n').trim();
+    let toolHtml = '';
+
+    if (toolParts.length > 0) {
+      toolHtml = toolParts.map(tp => {
+        const toolName   = (tp.toolInvocation && tp.toolInvocation.toolName) || tp.name || tp.tool || 'tool';
+        const toolInput  = (tp.toolInvocation && tp.toolInvocation.args)     || tp.input || tp.args || {};
+        const toolResult = (tp.toolInvocation && tp.toolInvocation.result)   || tp.result || null;
+        const inputStr   = typeof toolInput  === 'string' ? toolInput  : JSON.stringify(toolInput, null, 2);
+        const resultStr  = toolResult ? (typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult, null, 2)) : '';
+        return `
+          <details style="margin:8px 0;border:1px solid var(--color-border);border-radius:var(--radius-md);overflow:hidden;">
+            <summary style="padding:6px 12px;cursor:pointer;background:var(--color-surface-2);font-size:12px;color:var(--color-text-muted);display:flex;align-items:center;gap:6px;">
+              <span style="color:var(--color-primary);">⚙</span> <strong>${escapeHtml(toolName)}</strong>
+            </summary>
+            <div style="padding:8px 12px;">
+              <pre style="margin:0;font-size:11px;white-space:pre-wrap;color:var(--color-text-secondary);">${escapeHtml(inputStr)}</pre>
+              ${resultStr ? `<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--color-border);"><pre style="margin:0;font-size:11px;white-space:pre-wrap;color:var(--color-success);">${escapeHtml(resultStr)}</pre></div>` : ''}
+            </div>
+          </details>
+        `;
+      }).join('');
+    }
+
+    // Render into bubble
+    const b = getBubble();
+    if (b) {
+      const parsedText = responseText
+        ? (typeof marked !== 'undefined' ? marked.parse(responseText) : responseText.replace(/\n/g, '<br>'))
+        : '';
+      b.innerHTML = (toolHtml || '') + (parsedText || '<em style="color:var(--color-text-muted);">OpenCode completed the task with no text response.</em>');
+    }
+
+    const finalText = (toolParts.length > 0 ? '[OpenCode executed tools]\n\n' : '') + responseText;
+    setStatus(formatTime(new Date().toISOString()));
+    const ab = getAbortBtn();
+    if (ab) ab.remove();
+
+    // Save to memory
+    if (finalText.trim()) {
+      MemoryStore.addMessage(agentId, 'assistant', finalText);
+    }
+    MemoryStore.addActivity(agentId, 'chat', 'OpenCode completed task', 'success');
+    processArtifacts(agentId, finalText);
+
+    // Auto-open and refresh preview panel after OpenCode completes
+    if (!previewPanelOpen) {
+      previewPanelOpen = true;
+      renderAgentChat(document.getElementById('main-content'));
+    } else {
+      // Just refresh the preview content
+      loadPreviewFiles(agentId);
+    }
+
+  } catch (err) {
+    // If session is stale, clear it so next send creates a fresh one
+    if (err.message && (
+      err.message.includes('404') ||
+      err.message.includes('not found') ||
+      err.message.toLowerCase().includes('session')
+    )) {
+      delete window._opencodeSessions[agentId];
+    }
+    setError(`OpenCode error: ${err.message || 'Unknown error'}`);
+    showToast(`OpenCode: ${err.message || 'Unknown error'}`, 'error');
+  } finally {
+    isTyping = false;
+  }
+}
+
+// Abort the running OpenCode task for an agent
+async function opencodeAbortSession(agentId) {
+  const sessionId = window._opencodeSessions && window._opencodeSessions[agentId];
+  if (sessionId) {
+    try {
+      await OpenCodeAPI.abortSession(sessionId);
+      showToast('OpenCode task aborted', 'info');
+    } catch (e) {
+      // ignore abort errors
+    }
+  }
+  isTyping = false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 function sendDemoMessage(agentId, agent, messagesEl) {
   // Show typing indicator
@@ -1110,6 +1379,45 @@ function renderAIConfig(container) {
         </div>
       </div>
       
+      <!-- OpenCode (Coding Agent) -->
+      <div class="settings-section">
+        <div class="settings-section-header">
+          <div class="settings-section-title">🏗️ OpenCode (Coding Agent)</div>
+          <div class="settings-section-desc">Connect your OpenCode instance for autonomous code building. Used by SaaS Builder, Website Builder, and App Builder agents.</div>
+        </div>
+        <div class="settings-section-body">
+          <!-- Server URL -->
+          <div class="form-group">
+            <label class="form-label">OpenCode Server URL</label>
+            <input type="url" class="form-input" placeholder="https://your-opencode.up.railway.app"
+              value="${aiConfig.opencodeUrl || ''}"
+              onchange="updateConfigAndSave('opencodeUrl', this.value);">
+          </div>
+          <!-- Username -->
+          <div class="form-group">
+            <label class="form-label">Username</label>
+            <input type="text" class="form-input" placeholder="admin"
+              value="${aiConfig.opencodeUsername || ''}"
+              onchange="updateConfigAndSave('opencodeUsername', this.value);">
+          </div>
+          <!-- Password -->
+          <div class="form-group">
+            <label class="form-label">Password</label>
+            <div style="display:flex;gap:8px;">
+              <input type="password" class="form-input" placeholder="••••••••" id="opencode-pw-input"
+                value="${aiConfig.opencodePassword || ''}"
+                onchange="updateConfigAndSave('opencodePassword', this.value);">
+              <button class="btn btn-sm btn-ghost" onclick="togglePasswordVisibility('opencode-pw-input')">👁</button>
+            </div>
+          </div>
+          <!-- Test Connection -->
+          <div style="display:flex;align-items:center;gap:0;">
+            <button class="btn btn-primary" onclick="testOpenCodeConnection()" id="opencode-test-btn">Test Connection</button>
+            <span id="opencode-test-result" style="margin-left:12px;font-size:12px;"></span>
+          </div>
+        </div>
+      </div>
+      
       <!-- Cost Dashboard -->
       <div class="settings-section">
         <div class="settings-section-header">
@@ -1232,6 +1540,45 @@ async function testConnection(provider, configKey) {
     }
     showToast(`${provider} key saved. All models are routed through OpenRouter.`, 'info');
   }
+}
+
+function togglePasswordVisibility(inputId) {
+  const input = document.getElementById(inputId);
+  if (input) input.type = input.type === 'password' ? 'text' : 'password';
+}
+
+async function testOpenCodeConnection() {
+  const btn    = document.getElementById('opencode-test-btn');
+  const result = document.getElementById('opencode-test-result');
+  if (btn) btn.disabled = true;
+  if (result) {
+    result.textContent = 'Saving credentials & testing...';
+    result.style.color = 'var(--color-text-muted)';
+  }
+
+  // Save credentials to backend first so the proxy can use them
+  await MemoryStore.saveSettings({
+    opencodeUrl: aiConfig.opencodeUrl,
+    opencodeUsername: aiConfig.opencodeUsername,
+    opencodePassword: aiConfig.opencodePassword,
+  });
+
+  const test = await OpenCodeAPI.testConnection();
+
+  if (test.ok) {
+    if (result) {
+      result.textContent = `✅ Connected — OpenCode v${test.version}`;
+      result.style.color = 'var(--color-success)';
+    }
+    showToast(`OpenCode connected! v${test.version}`, 'success');
+  } else {
+    if (result) {
+      result.textContent = `❌ Failed — ${test.error}`;
+      result.style.color = 'var(--color-error)';
+    }
+    showToast(`OpenCode connection failed: ${test.error}`, 'error');
+  }
+  if (btn) btn.disabled = false;
 }
 
 // ============================================
@@ -2368,7 +2715,7 @@ function renderPendingFiles() {
 
 async function saveFileToBackend(agentId, sessionId, filename, filetype, filesize, content, source) {
   try {
-    const res = await fetch(`${API_URL}/api/files`, {
+    const res = await fetch(`${CGI_BIN}/api.py/files`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ agentId, sessionId, filename, filetype, filesize, content, source })
@@ -2383,7 +2730,7 @@ async function saveFileToBackend(agentId, sessionId, filename, filetype, filesiz
 async function loadFilesForAgent(agentId) {
   try {
     const sessionId = MemoryStore.getCurrentSession(agentId);
-    const res = await fetch(`${API_URL}/api/files?agent_id=${encodeURIComponent(agentId)}${sessionId ? '&session_id=' + encodeURIComponent(sessionId) : ''}`);
+    const res = await fetch(`${CGI_BIN}/api.py/files?agent_id=${encodeURIComponent(agentId)}${sessionId ? '&session_id=' + encodeURIComponent(sessionId) : ''}`);
     const data = await res.json();
     if (Array.isArray(data)) {
       fileCache[agentId] = data;
@@ -2403,7 +2750,7 @@ async function downloadFile(fileId) {
     if (localFile) {
       file = localFile;
     } else {
-      const res = await fetch(`${API_URL}/api/files?id=${encodeURIComponent(fileId)}`);
+      const res = await fetch(`${CGI_BIN}/api.py/files?id=${encodeURIComponent(fileId)}`);
       file = await res.json();
       if (file.error) { showToast(file.error, 'error'); return; }
     }
@@ -2450,7 +2797,7 @@ async function downloadFile(fileId) {
 
 async function deleteFile(fileId, agentId) {
   try {
-    await fetch(`${API_URL}/api/files?id=${encodeURIComponent(fileId)}`, { method: 'DELETE' });
+    await fetch(`${CGI_BIN}/api.py/files?id=${encodeURIComponent(fileId)}`, { method: 'DELETE' });
     if (fileCache[agentId]) {
       fileCache[agentId] = fileCache[agentId].filter(f => f.id !== fileId);
     }
@@ -2685,6 +3032,164 @@ function toggleArtifactsPanel() {
   } else {
     renderAgentChat(document.getElementById('main-content'));
   }
+}
+
+// ============================================
+// PREVIEW PANEL (OpenCode workspace preview)
+// ============================================
+
+// Cache of OpenCode workspace files per agent: agentId -> [{name, path, type}]
+let previewFileCache = {};
+
+function togglePreviewPanel(agentId) {
+  previewPanelOpen = !previewPanelOpen;
+  previewCurrentFile = null;
+  renderAgentChat(document.getElementById('main-content'));
+}
+
+async function loadPreviewFiles(agentId) {
+  const tabsEl = document.getElementById('preview-file-tabs');
+  const wrapEl = document.getElementById('preview-iframe-wrap');
+  const statusEl = document.getElementById('preview-status');
+  if (!tabsEl || !wrapEl) return;
+
+  if (statusEl) statusEl.textContent = 'Loading files...';
+
+  try {
+    const listing = await OpenCodeAPI.listFiles('/');
+    // listing is an array of {name, path, absolute, type, ignored}
+    // Filter to previewable files (html, css, js, json, txt, md, images)
+    const previewable = (listing || []).filter(f => {
+      if (f.type === 'directory') return false;
+      if (f.ignored) return false;
+      const ext = (f.name || '').split('.').pop().toLowerCase();
+      return ['html','htm','css','js','json','txt','md','svg','xml','jsx','tsx','ts','py','yaml','yml'].includes(ext);
+    });
+
+    previewFileCache[agentId] = previewable;
+
+    if (previewable.length === 0) {
+      tabsEl.innerHTML = '';
+      wrapEl.innerHTML = `
+        <div class="preview-empty">
+          <div class="preview-empty-icon">\uD83D\uDCC2</div>
+          <div class="preview-empty-text">No previewable files in the workspace yet.<br>Ask the agent to build something!</div>
+        </div>`;
+      if (statusEl) statusEl.textContent = 'No files found';
+      return;
+    }
+
+    // Render file tabs
+    tabsEl.innerHTML = previewable.map(f => {
+      const isActive = previewCurrentFile && previewCurrentFile.name === f.name;
+      return `<button class="preview-file-tab ${isActive ? 'active' : ''}" onclick="previewFile('${agentId}', '${escapeHtml(f.name)}')">${escapeHtml(f.name)}</button>`;
+    }).join('');
+
+    // Auto-select: prioritize index.html, then any .html, then first file
+    let autoSelect = previewable.find(f => f.name === 'index.html')
+      || previewable.find(f => f.name.endsWith('.html') || f.name.endsWith('.htm'))
+      || previewable[0];
+
+    // If we already had a file selected, keep it
+    if (previewCurrentFile) {
+      const still = previewable.find(f => f.name === previewCurrentFile.name);
+      if (still) autoSelect = still;
+    }
+
+    if (autoSelect) {
+      await previewFile(agentId, autoSelect.name);
+    }
+    if (statusEl) statusEl.textContent = `${previewable.length} file${previewable.length !== 1 ? 's' : ''}`;
+
+  } catch (err) {
+    wrapEl.innerHTML = `
+      <div class="preview-empty">
+        <div class="preview-empty-icon">\u26A0\uFE0F</div>
+        <div class="preview-empty-text">Failed to load files<br><span style="font-size:11px;color:var(--color-error);">${escapeHtml(err.message)}</span></div>
+      </div>`;
+    if (statusEl) statusEl.textContent = 'Error';
+  }
+}
+
+async function previewFile(agentId, filename) {
+  const wrapEl = document.getElementById('preview-iframe-wrap');
+  const statusEl = document.getElementById('preview-status');
+  if (!wrapEl) return;
+
+  // Update tab highlighting
+  document.querySelectorAll('.preview-file-tab').forEach(t => {
+    t.classList.toggle('active', t.textContent === filename);
+  });
+
+  // Show loading
+  wrapEl.innerHTML = '<div class="preview-loading">Loading ' + escapeHtml(filename) + '...</div>';
+  if (statusEl) statusEl.textContent = 'Loading...';
+
+  try {
+    const data = await OpenCodeAPI.readFile(filename);
+    // data is {type, content} — content is the file text
+    const content = (data && data.content) || (typeof data === 'string' ? data : '');
+    const ext = filename.split('.').pop().toLowerCase();
+
+    previewCurrentFile = { name: filename, content };
+
+    if (['html', 'htm'].includes(ext)) {
+      // Inject a link-interceptor script so clicking local links (e.g. about.html)
+      // sends a message to the parent instead of navigating (which would fail in srcdoc)
+      const linkInterceptor = `<script>
+        document.addEventListener('click', function(e) {
+          var a = e.target.closest('a');
+          if (!a) return;
+          var href = a.getAttribute('href');
+          if (!href) return;
+          // Skip anchors (#), javascript:, mailto:, tel:, and absolute URLs
+          if (href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:')) return;
+          if (/^https?:\/\//i.test(href)) return;
+          // It's a local file link — intercept it
+          e.preventDefault();
+          e.stopPropagation();
+          window.parent.postMessage({ type: 'preview-navigate', file: href }, '*');
+        }, true);
+      <\/script>`;
+
+      // Insert interceptor just before </body> or at the end
+      let augmented = content;
+      if (augmented.includes('</body>')) {
+        augmented = augmented.replace('</body>', linkInterceptor + '</body>');
+      } else {
+        augmented = augmented + linkInterceptor;
+      }
+
+      wrapEl.innerHTML = `<iframe sandbox="allow-scripts allow-same-origin" srcdoc="" style="width:100%;height:100%;border:none;background:#fff;"></iframe>`;
+      const iframe = wrapEl.querySelector('iframe');
+      if (iframe) iframe.srcdoc = augmented;
+    } else if (['svg'].includes(ext)) {
+      // Render SVG inline
+      wrapEl.innerHTML = `<div style="padding:20px;display:flex;align-items:center;justify-content:center;height:100%;background:#fff;">${content}</div>`;
+    } else {
+      // Show as syntax-highlighted code
+      const escaped = escapeHtml(content);
+      wrapEl.innerHTML = `
+        <div style="padding:16px;overflow:auto;height:100%;background:var(--color-surface-1);">
+          <pre style="margin:0;font-size:12px;font-family:'JetBrains Mono',monospace;white-space:pre-wrap;word-break:break-word;color:var(--color-text-muted);line-height:1.6;">${escaped}</pre>
+        </div>`;
+    }
+
+    if (statusEl) statusEl.textContent = filename;
+
+  } catch (err) {
+    wrapEl.innerHTML = `
+      <div class="preview-empty">
+        <div class="preview-empty-icon">\u26A0\uFE0F</div>
+        <div class="preview-empty-text">Failed to load ${escapeHtml(filename)}<br><span style="font-size:11px;color:var(--color-error);">${escapeHtml(err.message)}</span></div>
+      </div>`;
+    if (statusEl) statusEl.textContent = 'Error';
+  }
+}
+
+async function refreshPreview(agentId) {
+  await loadPreviewFiles(agentId);
+  showToast('Preview refreshed', 'success');
 }
 
 function switchArtifactsTab(tab) {

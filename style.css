@@ -755,6 +755,22 @@ html, body { height: 100%; overflow: hidden; margin: 0; }
   grid-template-columns: 1fr 300px 300px;
 }
 
+.chat-layout.preview-open {
+  grid-template-columns: 1fr 1fr;
+}
+
+.chat-layout.preview-open.memory-open {
+  grid-template-columns: 1fr 1fr 300px;
+}
+
+.chat-layout.preview-open.artifacts-open {
+  grid-template-columns: 1fr 1fr 300px;
+}
+
+.chat-layout.preview-open.memory-open.artifacts-open {
+  grid-template-columns: 1fr 1fr 300px 300px;
+}
+
 .chat-container {
   display: flex;
   flex-direction: column;
@@ -1727,6 +1743,16 @@ input[type="range"]::-webkit-slider-thumb {
   }
 
   .chat-layout.memory-open.artifacts-open {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-layout.preview-open {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-layout.preview-open.memory-open,
+  .chat-layout.preview-open.artifacts-open,
+  .chat-layout.preview-open.memory-open.artifacts-open {
     grid-template-columns: 1fr;
   }
   

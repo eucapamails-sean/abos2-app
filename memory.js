@@ -1,10 +1,6 @@
-// memory.js — ABOS Memory & Conversation Storage System
+// memory.js — ABOS Memory & Conversation Storage System (CGI-bin backed)
 
-// ═══ API URL CONFIGURATION ═══════════════════════════════════
-// Set this to your Railway backend URL (no trailing slash)
-// Example: https://abos-api-production.up.railway.app
-const API_URL = window.ABOS_API_URL || '';
-// ═════════════════════════════════════════════════════════════
+const CGI_BIN = '__CGI_BIN__';
 
 const MemoryStore = {
   // Per-agent memory stores
@@ -225,7 +221,7 @@ const MemoryStore = {
     if (body && method !== 'GET') {
       opts.body = JSON.stringify(body);
     }
-    const res = await fetch(`${API_URL}/api${path}`, opts);
+    const res = await fetch(`${CGI_BIN}/api.py${path}`, opts);
     return res.json();
   },
 
